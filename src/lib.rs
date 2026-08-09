@@ -9,6 +9,9 @@ use thiserror::Error;
 mod in_memory;
 pub use in_memory::InMemoryRecall;
 
+mod file;
+pub use file::FileRecall;
+
 #[cfg(test)]
 mod conformance;
 
