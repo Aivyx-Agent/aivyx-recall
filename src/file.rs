@@ -54,8 +54,15 @@ impl FileRecall {
         let path = self.topic_path(topic);
         match std::fs::read_to_string(&path) {
             Ok(raw) => {
-                let file: TopicFile =
+                let mut file: TopicFile =
                     serde_json::from_str(&raw).map_err(|e| RecallError::Encoding(e.to_string()))?;
+                // Defense against a filename collision (sanitized prefix + FNV-1a hash both
+                // matching for two different topic strings): FNV-1a isn't collision-resistant,
+                // so without this filter a colliding `get_recent`/`forget` on topic B could
+                // silently return/delete topic A's entries. True collisions are
+                // birthday-negligible and structurally can't cross project/namespace
+                // boundaries, but the filter is one line and every caller of `load` benefits.
+                file.entries.retain(|e| e.topic == topic);
                 Ok(file.entries)
             }
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(Vec::new()),
@@ -172,6 +179,40 @@ mod tests {
         let entries = reopened.get_recent("topic", 10).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].body, "remember this");
+    }
+
+    #[tokio::test]
+    async fn load_filters_out_entries_from_a_different_topic_sharing_the_same_file() {
+        // Simulates a filename collision (sanitized-prefix + FNV-1a hash both matching for
+        // two distinct topic strings) by writing a `TopicFile` with mixed-topic entries
+        // straight to the path `topic_path` computes for "topic-a", then confirming
+        // `get_recent` for "topic-a" returns only its own entries, not "topic-b"'s.
+        let dir = tempfile::tempdir().unwrap();
+        let recall = FileRecall::new(dir.path());
+        let path = recall.topic_path("topic-a");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mixed = TopicFile {
+            entries: vec![
+                RecallEntry {
+                    topic: "topic-a".to_string(),
+                    body: "belongs to a".to_string(),
+                    seq: 0,
+                    created_at_secs: 0,
+                },
+                RecallEntry {
+                    topic: "topic-b".to_string(),
+                    body: "belongs to b, should never surface for a".to_string(),
+                    seq: 1,
+                    created_at_secs: 0,
+                },
+            ],
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&mixed).unwrap()).unwrap();
+
+        let entries = recall.get_recent("topic-a", 10).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].topic, "topic-a");
+        assert_eq!(entries[0].body, "belongs to a");
     }
 
     #[test]
