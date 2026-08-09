@@ -50,7 +50,7 @@ impl Recall for InMemoryRecall {
         }
         let map = self.entries.lock().unwrap();
         let mut matching: Vec<RecallEntry> = map.get(topic).cloned().unwrap_or_default();
-        matching.sort_by(|a, b| b.seq.cmp(&a.seq));
+        matching.sort_by_key(|e| std::cmp::Reverse(e.seq));
         matching.truncate(limit);
         Ok(matching)
     }

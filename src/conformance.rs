@@ -6,12 +6,18 @@ use crate::{Recall, RecallError};
 
 pub(crate) async fn assert_conformance(recall: &dyn Recall) {
     // Empty-topic errors on all three methods.
-    assert!(matches!(recall.put("", "x").await, Err(RecallError::EmptyTopic)));
+    assert!(matches!(
+        recall.put("", "x").await,
+        Err(RecallError::EmptyTopic)
+    ));
     assert!(matches!(
         recall.get_recent("", 1).await,
         Err(RecallError::EmptyTopic)
     ));
-    assert!(matches!(recall.forget("").await, Err(RecallError::EmptyTopic)));
+    assert!(matches!(
+        recall.forget("").await,
+        Err(RecallError::EmptyTopic)
+    ));
 
     // Zero limit.
     assert!(matches!(
@@ -20,7 +26,10 @@ pub(crate) async fn assert_conformance(recall: &dyn Recall) {
     ));
 
     // Unwritten topic returns an empty Vec, not an error.
-    assert_eq!(recall.get_recent("unwritten-topic", 10).await.unwrap(), vec![]);
+    assert_eq!(
+        recall.get_recent("unwritten-topic", 10).await.unwrap(),
+        vec![]
+    );
 
     // seq is monotonic per topic; get_recent orders newest first.
     let seq0 = recall.put("topic-a", "first").await.unwrap();

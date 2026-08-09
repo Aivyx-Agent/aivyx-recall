@@ -88,7 +88,12 @@ impl Recall for FileRecall {
         }
         let _guard = self.lock.lock().await;
         let mut entries = self.load(topic)?;
-        let seq = entries.iter().map(|e| e.seq).max().map(|m| m + 1).unwrap_or(0);
+        let seq = entries
+            .iter()
+            .map(|e| e.seq)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
         let created_at_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -112,7 +117,7 @@ impl Recall for FileRecall {
         }
         let _guard = self.lock.lock().await;
         let mut entries = self.load(topic)?;
-        entries.sort_by(|a, b| b.seq.cmp(&a.seq));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.seq));
         entries.truncate(limit);
         Ok(entries)
     }
