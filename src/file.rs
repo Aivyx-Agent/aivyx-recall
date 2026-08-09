@@ -58,10 +58,15 @@ impl FileRecall {
                     serde_json::from_str(&raw).map_err(|e| RecallError::Encoding(e.to_string()))?;
                 // Defense against a filename collision (sanitized prefix + FNV-1a hash both
                 // matching for two different topic strings): FNV-1a isn't collision-resistant,
-                // so without this filter a colliding `get_recent`/`forget` on topic B could
-                // silently return/delete topic A's entries. True collisions are
+                // so without this filter a colliding `get_recent` on topic B could silently
+                // return topic A's entries too, and `forget`'s reported count would include
+                // them. This filter closes the read-side leak and makes that count honest —
+                // it does NOT protect the colliding entries from being destroyed: `forget`
+                // still unlinks the whole shared file, and `put` still writes back only the
+                // filtered set, discarding whatever it filtered out. True collisions are
                 // birthday-negligible and structurally can't cross project/namespace
-                // boundaries, but the filter is one line and every caller of `load` benefits.
+                // boundaries, so this residual risk is accepted rather than engineered away
+                // (e.g. by moving to per-entry files or a real collision-resolution scheme).
                 file.entries.retain(|e| e.topic == topic);
                 Ok(file.entries)
             }
