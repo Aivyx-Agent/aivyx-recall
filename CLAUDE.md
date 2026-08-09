@@ -108,8 +108,17 @@ each consumer's own layer on top of this trait, not this crate's concern.
   `docs/superpowers/specs/2026-08-09-aivyx-recall-design.md` in the
   `aivyx-coder` repo for the full design rationale this crate was
   extracted for.
-- **`aivyx`** has not adopted this crate. When it does, its existing
-  `RedbMemory` (encrypted, capability-scoped) is expected to become a
-  second `Recall` implementor alongside `FileRecall`, not something built
-  into this crate — that migration is real, deferred future work, not
-  something to assume is in progress.
+- **`aivyx`** does not use this crate, and — as of 2026-08-10 — is not
+  expected to. Wrapping its `RedbMemory` around this crate's `Recall`
+  trait was investigated as a follow-up and declined: `aivyx-memory`'s
+  own `Memory` trait has grown to 18 methods (search ranking, eviction,
+  `gc_*`, embeddings/ANN — all things this crate deliberately doesn't
+  own), and its sequence counter is global-per-substrate where this
+  crate's is deliberately per-topic (see `RecallEntry::seq`'s doc comment
+  in `src/lib.rs`) — not reconcilable without either growing this crate
+  into something its own design explicitly declines to be, or changing
+  tested behavior in `aivyx-memory`. `aivyx-memory` stays on its own
+  storage, unchanged. Don't propose this migration again without first
+  re-reading `aivyx-memory`'s actual current `Memory` trait — if it's
+  shrunk back toward the substrate-agnostic shape its own module docs
+  describe, the calculus here may have changed.
