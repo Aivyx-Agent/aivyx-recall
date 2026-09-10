@@ -17,7 +17,9 @@ search) — **that crate has not been migrated onto this substrate yet**,
 so don't assume `aivyx` actually consumes this crate today; see
 "Consumers" below.
 
-This crate has no CI workflow configured.
+CI (`.github/workflows/ci.yml`) runs `cargo build`, `cargo test`, `cargo
+clippy --all-targets -- -D warnings`, and `cargo fmt --check` on every
+push/PR against `main`.
 
 ## Build, test, lint
 
