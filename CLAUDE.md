@@ -68,7 +68,14 @@ Everything lives in `src/`, four files:
   permanently wedge that topic: `get_recent` logs a warning and returns an
   empty list, `forget` logs a warning and deletes it (reporting `0`
   forgotten), and `put` logs a warning, moves it aside to
-  `<name>.corrupt-<unix-secs>`, and starts the topic fresh.
+  `<name>.corrupt-<unix-secs>`, and starts the topic fresh. Each topic is
+  capped at `FileRecall::with_max_entries_per_topic`'s value (default
+  1000, set via `FileRecall::new`): a `put` that would exceed it drops the
+  oldest (lowest-`seq`) entries first, bounding both the topic file's size
+  and the cost of `put`'s whole-file rewrite. `get_recent`'s read/parse/sort
+  also runs on `spawn_blocking` (like `put`/`forget`, but without the
+  cross-process `flock`), so a large topic file can't stall the async
+  executor while it's being read.
 - `conformance.rs` — one async function, `assert_conformance`, run
   against every implementation as a `&dyn Recall` trait object, so
   `InMemoryRecall` and `FileRecall` both prove the identical behavioral

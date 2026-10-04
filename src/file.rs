@@ -192,20 +192,26 @@ impl Recall for FileRecall {
             return Err(RecallError::ZeroLimit);
         }
         let _guard = self.lock.lock().await;
-        let mut entries = match load(&self.dir, topic) {
-            Ok(entries) => entries,
-            Err(RecallError::Encoding(reason)) => {
-                eprintln!(
-                    "warning: aivyx-recall: topic {topic:?} failed to parse ({reason}); \
-                     returning an empty list instead of erroring"
-                );
-                Vec::new()
-            }
-            Err(e) => return Err(e),
-        };
-        entries.sort_by_key(|e| std::cmp::Reverse(e.seq));
-        entries.truncate(limit);
-        Ok(entries)
+        let dir = self.dir.clone();
+        let topic_owned = topic.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut entries = match load(&dir, &topic_owned) {
+                Ok(entries) => entries,
+                Err(RecallError::Encoding(reason)) => {
+                    eprintln!(
+                        "warning: aivyx-recall: topic {topic_owned:?} failed to parse \
+                         ({reason}); returning an empty list instead of erroring"
+                    );
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            };
+            entries.sort_by_key(|e| std::cmp::Reverse(e.seq));
+            entries.truncate(limit);
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| RecallError::Backend(format!("recall get_recent task panicked: {e}")))?
     }
 
     async fn forget(&self, topic: &str) -> Result<usize, RecallError> {
@@ -648,6 +654,119 @@ mod tests {
             entries[999].seq, 5,
             "oldest surviving entry should be the 1000th most recent"
         );
+    }
+
+    // --- Task 5: get_recent moves its blocking I/O off the async task --------
+
+    #[tokio::test]
+    async fn get_recent_runs_off_the_async_executor_thread() {
+        // `#[tokio::test]` defaults to a single-threaded ("current_thread")
+        // executor. If `get_recent` does its filesystem read/parse/sort
+        // directly on the async task (the old behavior) instead of via
+        // `spawn_blocking`, that whole span is one synchronous poll with no
+        // `.await` inside it — nothing else can run on that one thread
+        // while it's in progress. A concurrently spawned task that
+        // increments a counter via `yield_now` would then get zero extra
+        // turns during that span, because the single OS thread never comes
+        // back to the scheduler until `get_recent` itself returns.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Build a topic file directly (bypassing `put` and its cap) large
+        // enough that reading, parsing, and sorting it takes a measurable
+        // amount of wall-clock time.
+        let big_entries: Vec<RecallEntry> = (0..20_000)
+            .map(|i| RecallEntry {
+                topic: "big".to_string(),
+                body: "x".repeat(200),
+                seq: i,
+                created_at_secs: 0,
+            })
+            .collect();
+        save(dir.path(), "big", &big_entries).unwrap();
+
+        let recall = FileRecall::new(dir.path());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let spinner = tokio::spawn(async move {
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Let the spinner settle into its loop before starting the call
+        // under test.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let before = counter.load(Ordering::SeqCst);
+
+        recall.get_recent("big", 10_000).await.unwrap();
+
+        let after = counter.load(Ordering::SeqCst);
+        let _ = stop_tx.send(());
+        spinner.await.unwrap();
+
+        assert!(
+            after - before > 3,
+            "expected the spinner task to keep making progress while \
+             get_recent ran (before={before}, after={after}); it stalled, \
+             meaning get_recent is still blocking the async executor thread \
+             instead of running its I/O on spawn_blocking"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_recent_returns_the_right_entries_under_concurrent_writers() {
+        // Writer runs on its own OS thread/runtime pointed at the same dir,
+        // concurrently with repeated get_recent calls from this test's own
+        // task, now that get_recent runs its I/O via spawn_blocking (a
+        // separate thread from this test's single-threaded executor)
+        // rather than directly on the async task. Every observed snapshot
+        // must parse cleanly (atomic rename) and never show a seq that
+        // wasn't actually written; the final read must see every write.
+        let dir = tempfile::tempdir().unwrap();
+        const WRITES: usize = 300;
+        let dir_path = dir.path().to_path_buf();
+
+        let writer = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let recall = FileRecall::new(&dir_path).with_max_entries_per_topic(WRITES);
+            rt.block_on(async {
+                for i in 0..WRITES {
+                    recall
+                        .put("shared-topic", &format!("entry-{i}"))
+                        .await
+                        .unwrap();
+                }
+            });
+        });
+
+        let reader = FileRecall::new(dir.path());
+        let mut max_seq_seen = None;
+        for _ in 0..200 {
+            let entries = reader.get_recent("shared-topic", 10_000).await.unwrap();
+            if let Some(newest) = entries.first() {
+                max_seq_seen = Some(max_seq_seen.unwrap_or(0).max(newest.seq));
+            }
+            // seq values observed in one snapshot must be unique.
+            let seqs: std::collections::HashSet<u64> = entries.iter().map(|e| e.seq).collect();
+            assert_eq!(seqs.len(), entries.len(), "duplicate seq in one snapshot");
+        }
+
+        writer.join().unwrap();
+
+        let final_entries = reader.get_recent("shared-topic", 10_000).await.unwrap();
+        assert_eq!(final_entries.len(), WRITES, "final read lost writes");
+        assert_eq!(final_entries[0].seq as usize, WRITES - 1);
+        if let Some(seen) = max_seq_seen {
+            assert!(seen <= (WRITES - 1) as u64, "saw a seq never written");
+        }
     }
 
     // --- Task 3: a corrupt topic file doesn't permanently block the topic ----
