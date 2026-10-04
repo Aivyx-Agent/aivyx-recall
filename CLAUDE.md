@@ -51,11 +51,24 @@ Everything lives in `src/`, four files:
   two are a deliberate duplicate, not a shared dependency, because
   `aivyx-coder`'s `aivyx-tools` crate can't depend on `aivyx-core` (see
   that function's doc comment on both sides before changing either). A
-  single `tokio::sync::Mutex` serializes every read-modify-write across
-  all topics. Written via direct `std::fs::write` + `chmod 0600` on Unix
-  — not atomic-via-tempfile-rename, an accepted tradeoff matching the
-  same one `aivyx-coder`'s own session-persistence layer makes (a torn
-  write from a mid-crash loses one topic's file, not more).
+  `tokio::sync::Mutex` serializes every read-modify-write within one
+  process; a cross-process exclusive `flock` (via the `fd-lock` crate, on
+  a dedicated lock file in the memory directory, held while running on a
+  `spawn_blocking` thread) additionally serializes `put`/`forget` across
+  separate processes pointed at the same directory — load-bearing because
+  `aivyx-coder` runs as several independent processes (e.g. two
+  terminals) sharing one memory directory; without it, two processes'
+  concurrent `put`s lose entries and can hand out duplicate `seq` values.
+  Topic files are written atomically (temp file in the same directory,
+  then `rename`d over the target), so a concurrent `get_recent` never
+  observes a torn write; the memory directory is created with `0700` and
+  every file this backend creates (topic files, the lock file, atomic-write
+  temp files) is opened with `0600` from the moment of creation, not
+  `chmod`-ed after the fact. A topic file that fails to parse doesn't
+  permanently wedge that topic: `get_recent` logs a warning and returns an
+  empty list, `forget` logs a warning and deletes it (reporting `0`
+  forgotten), and `put` logs a warning, moves it aside to
+  `<name>.corrupt-<unix-secs>`, and starts the topic fresh.
 - `conformance.rs` — one async function, `assert_conformance`, run
   against every implementation as a `&dyn Recall` trait object, so
   `InMemoryRecall` and `FileRecall` both prove the identical behavioral
