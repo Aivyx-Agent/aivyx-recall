@@ -28,6 +28,16 @@ use crate::{Recall, RecallEntry, RecallError};
 /// one, never a torn write — unlike a direct `std::fs::write`, which can
 /// leave a reader looking at a half-written file.
 ///
+/// Each topic is capped at [`DEFAULT_MAX_ENTRIES_PER_TOPIC`] entries by
+/// default (override via [`FileRecall::with_max_entries_per_topic`]): a
+/// `put` that would push a topic over the cap drops the oldest entries
+/// (lowest `seq`) first, keeping the newest. This bounds both the topic
+/// file's on-disk size and the cost of `put`'s read-modify-write cycle,
+/// which rewrites the whole file every time. `seq` values stay unique and
+/// strictly increasing regardless of the cap — only which entries are
+/// retained is affected, never the counter, since the highest-`seq` entry
+/// already written is always among those kept.
+///
 /// Two separate processes (e.g. two `aivyx-coder` terminals) can point
 /// `FileRecall` at the same directory. To keep a `put`/`forget`'s
 /// read-modify-write cycle from racing a concurrent process's own cycle on
@@ -43,7 +53,10 @@ use crate::{Recall, RecallEntry, RecallError};
 /// only one task in *this* process does that blocking work at a time.
 /// `get_recent` is read-only and doesn't need the cross-process lock —
 /// atomic rename alone is what makes concurrent reads safe — but still
-/// takes the in-process `Mutex`, as before.
+/// takes the in-process `Mutex`, as before, and still runs its
+/// read/parse/sort on a blocking thread (`spawn_blocking`, without the
+/// `flock`) rather than directly on the async task, so a large topic file
+/// can't stall the async executor while it's read.
 ///
 /// [`fd-lock`]: https://docs.rs/fd-lock
 ///
@@ -57,7 +70,12 @@ use crate::{Recall, RecallEntry, RecallError};
 pub struct FileRecall {
     dir: PathBuf,
     lock: Mutex<()>,
+    max_entries_per_topic: usize,
 }
+
+/// Default value for [`FileRecall::with_max_entries_per_topic`], used by
+/// [`FileRecall::new`].
+pub const DEFAULT_MAX_ENTRIES_PER_TOPIC: usize = 1000;
 
 #[derive(Serialize, Deserialize, Default)]
 struct TopicFile {
@@ -69,7 +87,19 @@ impl FileRecall {
         Self {
             dir: dir.into(),
             lock: Mutex::new(()),
+            max_entries_per_topic: DEFAULT_MAX_ENTRIES_PER_TOPIC,
         }
+    }
+
+    /// Caps each topic at `max` entries: a `put` that would push a topic
+    /// over `max` drops the oldest entries (lowest `seq`) first, keeping
+    /// the newest `max`. Defaults to [`DEFAULT_MAX_ENTRIES_PER_TOPIC`] via
+    /// [`FileRecall::new`]. `seq` stays unique and strictly increasing
+    /// regardless of `max` — this only affects which entries are retained,
+    /// never the counter.
+    pub fn with_max_entries_per_topic(mut self, max: usize) -> Self {
+        self.max_entries_per_topic = max;
+        self
     }
 
     #[cfg(test)]
@@ -115,6 +145,7 @@ impl Recall for FileRecall {
         let dir = self.dir.clone();
         let topic_owned = topic.to_string();
         let body_owned = body.to_string();
+        let max_entries_per_topic = self.max_entries_per_topic;
         self.with_exclusive_lock(move || {
             let mut entries = match load(&dir, &topic_owned) {
                 Ok(entries) => entries,
@@ -137,6 +168,16 @@ impl Recall for FileRecall {
                 seq,
                 created_at_secs,
             });
+            // Cap the topic at `max_entries_per_topic`, dropping the
+            // oldest (lowest-`seq`) entries first. The entry just pushed
+            // carries the highest `seq`, so it's always kept, and the next
+            // `put`'s `seq` computation above (`max + 1`) stays correct
+            // regardless of how much gets dropped here.
+            if entries.len() > max_entries_per_topic {
+                entries.sort_by_key(|e| e.seq);
+                let excess = entries.len() - max_entries_per_topic;
+                entries.drain(0..excess);
+            }
             save(&dir, &topic_owned, &entries)?;
             Ok(seq)
         })
@@ -558,6 +599,55 @@ mod tests {
         for r in readers {
             r.join().unwrap();
         }
+    }
+
+    // --- Task 4: bounded topics -----------------------------------------------
+
+    #[tokio::test]
+    async fn put_caps_topic_at_configured_max_entries_dropping_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let recall = FileRecall::new(dir.path()).with_max_entries_per_topic(5);
+        for i in 0..8 {
+            recall.put("topic", &format!("entry-{i}")).await.unwrap();
+        }
+
+        let entries = recall.get_recent("topic", 100).await.unwrap();
+        assert_eq!(entries.len(), 5, "topic should be capped at 5 entries");
+        let bodies: Vec<&str> = entries.iter().map(|e| e.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec!["entry-7", "entry-6", "entry-5", "entry-4", "entry-3"],
+            "oldest entries should have been dropped, newest kept"
+        );
+
+        // seq values stay unique and strictly increasing — the cap only
+        // affects which entries are retained, not the counter.
+        let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![7, 6, 5, 4, 3]);
+
+        // The next put continues the seq sequence rather than restarting it.
+        let next_seq = recall.put("topic", "entry-8").await.unwrap();
+        assert_eq!(next_seq, 8);
+    }
+
+    #[tokio::test]
+    async fn put_defaults_to_capping_a_topic_at_1000_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let recall = FileRecall::new(dir.path());
+        for i in 0..1005u64 {
+            recall.put("topic", &format!("entry-{i}")).await.unwrap();
+        }
+
+        let entries = recall.get_recent("topic", 10_000).await.unwrap();
+        assert_eq!(entries.len(), 1000, "default cap should be 1000 entries");
+        assert_eq!(
+            entries[0].seq, 1004,
+            "newest entry should still be seq 1004"
+        );
+        assert_eq!(
+            entries[999].seq, 5,
+            "oldest surviving entry should be the 1000th most recent"
+        );
     }
 
     // --- Task 3: a corrupt topic file doesn't permanently block the topic ----
