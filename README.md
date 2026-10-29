@@ -30,3 +30,22 @@ shape actually fits it.
 
 See `docs/superpowers/specs/2026-08-09-aivyx-recall-design.md` in the
 `aivyx-coder` repo for the full design rationale.
+
+## Returned text is untrusted
+
+`get_recent` returns stored bodies verbatim. Anything an agent saved in an
+earlier session, including text it took from a web page or a file while
+under an injection, comes back in later sessions. The crate does not fence
+or scan it. A consumer must present recalled text as quoted data (a fenced
+block that names its source) and keep running its injection scan on it.
+
+## Known limitations
+
+- `FileRecall::put` rejects a body over `MAX_BODY_BYTES` (64 KiB) and keeps
+  at most 1000 entries per topic. `InMemoryRecall` is a test fake and has
+  neither limit.
+- Topic files are named from a sanitised prefix plus a 64-bit FNV-1a hash.
+  If two different topic names ever map to the same file, `put` and `forget`
+  fail with a backend error instead of overwriting the other topic's entries;
+  there is no automatic resolution, so choose topic names that do not
+  collide.

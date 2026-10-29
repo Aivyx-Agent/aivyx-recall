@@ -77,6 +77,11 @@ pub struct FileRecall {
 /// [`FileRecall::new`].
 pub const DEFAULT_MAX_ENTRIES_PER_TOPIC: usize = 1000;
 
+/// Largest entry body `put` accepts, in bytes. Every `put` rewrites the
+/// whole topic file, so an unbounded body would make each later write
+/// cost that much too.
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
+
 #[derive(Serialize, Deserialize, Default)]
 struct TopicFile {
     entries: Vec<RecallEntry>,
@@ -142,11 +147,18 @@ impl Recall for FileRecall {
         if topic.is_empty() {
             return Err(RecallError::EmptyTopic);
         }
+        if body.len() > MAX_BODY_BYTES {
+            return Err(RecallError::Backend(format!(
+                "recall entry is {} bytes, over the {MAX_BODY_BYTES}-byte limit",
+                body.len()
+            )));
+        }
         let dir = self.dir.clone();
         let topic_owned = topic.to_string();
         let body_owned = body.to_string();
         let max_entries_per_topic = self.max_entries_per_topic;
         self.with_exclusive_lock(move || {
+            refuse_on_collision(&dir, &topic_owned)?;
             let mut entries = match load(&dir, &topic_owned) {
                 Ok(entries) => entries,
                 Err(RecallError::Encoding(reason)) => {
@@ -220,26 +232,54 @@ impl Recall for FileRecall {
         }
         let dir = self.dir.clone();
         let topic_owned = topic.to_string();
-        self.with_exclusive_lock(move || match load(&dir, &topic_owned) {
-            Ok(entries) => {
-                let count = entries.len();
-                if count > 0 {
-                    remove_file_if_exists(&topic_path_in(&dir, &topic_owned))?;
-                }
-                Ok(count)
-            }
-            Err(RecallError::Encoding(reason)) => {
-                eprintln!(
-                    "warning: aivyx-recall: topic {topic_owned:?} failed to parse ({reason}); \
-                     deleting it and reporting 0 entries forgotten"
-                );
-                remove_file_if_exists(&topic_path_in(&dir, &topic_owned))?;
-                Ok(0)
-            }
-            Err(e) => Err(e),
+        self.with_exclusive_lock(move || {
+            refuse_on_collision(&dir, &topic_owned)?;
+            forget_locked(&dir, &topic_owned)
         })
         .await
     }
+}
+
+fn forget_locked(dir: &Path, topic: &str) -> Result<usize, RecallError> {
+    match load(dir, topic) {
+        Ok(entries) => {
+            let count = entries.len();
+            if count > 0 {
+                remove_file_if_exists(&topic_path_in(dir, topic))?;
+            }
+            Ok(count)
+        }
+        Err(RecallError::Encoding(reason)) => {
+            eprintln!(
+                "warning: aivyx-recall: topic {topic:?} failed to parse ({reason}); \
+                 deleting it and reporting 0 entries forgotten"
+            );
+            remove_file_if_exists(&topic_path_in(dir, topic))?;
+            Ok(0)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Errors when the file this topic maps to already holds another topic's
+/// entries (a filename collision: sanitised prefix and 64-bit hash both
+/// equal). Writing or deleting would destroy them, so the write is
+/// refused instead.
+fn refuse_on_collision(dir: &Path, topic: &str) -> Result<(), RecallError> {
+    let path = topic_path_in(dir, topic);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(()); // missing or unparseable: handled by load()
+    };
+    let Ok(file) = serde_json::from_str::<TopicFile>(&raw) else {
+        return Ok(());
+    };
+    if file.entries.iter().any(|e| e.topic != topic) {
+        return Err(RecallError::Backend(format!(
+            "topic {topic:?} maps to a file that holds another topic's entries \
+             (name collision); refusing to overwrite or delete it"
+        )));
+    }
+    Ok(())
 }
 
 fn topic_path_in(dir: &Path, topic: &str) -> PathBuf {
@@ -262,12 +302,8 @@ fn load(dir: &Path, topic: &str) -> Result<Vec<RecallEntry>, RecallError> {
             // so without this filter a colliding `get_recent` on topic B could silently
             // return topic A's entries too, and `forget`'s reported count would include
             // them. This filter closes the read-side leak and makes that count honest —
-            // it does NOT protect the colliding entries from being destroyed: `forget`
-            // still unlinks the whole shared file, and `put` still writes back only the
-            // filtered set, discarding whatever it filtered out. True collisions are
-            // birthday-negligible and structurally can't cross project/namespace
-            // boundaries, so this residual risk is accepted rather than engineered away
-            // (e.g. by moving to per-entry files or a real collision-resolution scheme).
+            // `put` and `forget` check the file with `refuse_on_collision` and fail
+            // rather than destroy the other topic's entries.
             file.entries.retain(|e| e.topic == topic);
             Ok(file.entries)
         }
@@ -401,6 +437,38 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_topic_file_collision_is_an_error_not_silent_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = FileRecall::new(dir.path());
+        // Simulate a collision: topic "b"'s file holds topic "a"'s entry.
+        r.put("a", "keep me").await.unwrap();
+        std::fs::copy(
+            topic_path_in(dir.path(), "a"),
+            topic_path_in(dir.path(), "b"),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(topic_path_in(dir.path(), "b")).unwrap();
+        assert!(r.put("b", "x").await.is_err());
+        assert!(r.forget("b").await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(topic_path_in(dir.path(), "b")).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_entry_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = FileRecall::new(dir.path());
+        let err = r
+            .put("t", &"x".repeat(MAX_BODY_BYTES + 1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+        assert!(r.put("t", &"x".repeat(MAX_BODY_BYTES)).await.is_ok());
+    }
+
     use super::*;
     use crate::conformance::assert_conformance;
 
